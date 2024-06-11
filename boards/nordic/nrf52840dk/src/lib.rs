@@ -249,6 +249,8 @@ pub struct Platform {
     kv_driver: &'static KVDriver,
     scheduler: &'static RoundRobinSched<'static>,
     systick: cortexm4::systick::SysTick,
+    nonvolatile_storage:
+        &'static capsules_extra::isolated_nonvolatile_storage_driver::IsolatedNonvolatileStorage<'static>,
 }
 
 impl SyscallDriverLookup for Platform {
@@ -275,6 +277,7 @@ impl SyscallDriverLookup for Platform {
             capsules_core::spi_controller::DRIVER_NUM => f(Some(self.spi_controller)),
             capsules_extra::net::thread::driver::DRIVER_NUM => f(Some(self.thread_driver)),
             capsules_extra::kv_driver::DRIVER_NUM => f(Some(self.kv_driver)),
+            capsules_extra::isolated_nonvolatile_storage_driver::DRIVER_NUM => f(Some(self.nonvolatile_storage)),
             _ => f(None),
         }
     }
@@ -846,7 +849,7 @@ pub unsafe fn start() -> (
     //--------------------------------------------------------------------------
     // Uncomment to experiment with this.
 
-    // // Create the strings we include in the USB descriptor.
+    // Create the strings we include in the USB descriptor.
     // let strings = static_init!(
     //     [&str; 3],
     //     [
@@ -891,6 +894,35 @@ pub unsafe fn start() -> (
     //--------------------------------------------------------------------------
     // PLATFORM SETUP, SCHEDULER, AND START KERNEL LOOP
     //--------------------------------------------------------------------------
+    
+    //--------------------------------------------------------------------------
+    // NONVOLATILE STORAGE
+    //--------------------------------------------------------------------------
+
+    // Kernel storage region, allocated with the storage_volume!
+    // macro in common/utils.rs
+    extern "C" {
+        /// Beginning on the ROM region containing app images.
+        static _sstorage: u8;
+        static _estorage: u8;
+    }
+
+    // 32kB of userspace-accessible storage, page aligned:
+    kernel::storage_volume!(APP_STORAGE, 32);
+
+    let isolated_nonvolatile_storage = components::isolated_nonvolatile_storage::IsolatedNonvolatileStorageComponent::new(
+        board_kernel,
+        capsules_extra::isolated_nonvolatile_storage_driver::DRIVER_NUM,
+        &nrf52840_peripherals.nrf52.nvmc,
+        // TODO: temporarily storing this in kernel buffer. need to move somewhere else...
+        core::ptr::addr_of!(APP_STORAGE) as usize,
+        APP_STORAGE.len(),
+        core::ptr::null::<()>() as usize,
+        0
+    )
+    .finalize(components::isolated_nonvolatile_storage_component_static!(
+        nrf52840::nvmc::Nvmc
+    ));
 
     let scheduler = components::sched::round_robin::RoundRobinComponent::new(&*addr_of!(PROCESSES))
         .finalize(components::round_robin_component_static!(NUM_PROCS));
@@ -921,6 +953,7 @@ pub unsafe fn start() -> (
         kv_driver,
         scheduler,
         systick: cortexm4::systick::SysTick::new_with_calibration(64000000),
+        nonvolatile_storage: isolated_nonvolatile_storage,
     };
 
     let _ = platform.pconsole.start();
