@@ -62,7 +62,7 @@ use core::cell::Cell;
 use core::cmp;
 
 use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
-use kernel::hil;
+use kernel::{debug, hil};
 use kernel::processbuffer::{ReadableProcessBuffer, WriteableProcessBuffer};
 use kernel::syscall::{CommandReturn, SyscallDriver};
 use kernel::utilities::cells::{OptionalCell, TakeCell};
@@ -215,6 +215,7 @@ impl<'a> NonvolatileStorage<'a> {
         length: usize,
         processid: Option<ProcessId>,
     ) -> Result<(), ErrorCode> {
+        debug!("regular nvm. NOT ISOLATED");
         // Do bounds check.
         match command {
             NonvolatileCommand::UserspaceRead | NonvolatileCommand::UserspaceWrite => {

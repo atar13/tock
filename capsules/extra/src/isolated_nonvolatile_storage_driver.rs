@@ -73,6 +73,8 @@ use kernel::{ErrorCode, ProcessId};
 use capsules_core::driver;
 pub const DRIVER_NUM: usize = driver::NUM::IsolatedNvmStorage as usize;
 
+const TODO_CHANGE_FLASH_REGION_SIZE: usize = 100;
+
 /// IDs for subscribed upcalls.
 mod upcall {
     /// Read done callback.
@@ -115,11 +117,18 @@ pub enum IsolatedNonvolatileUser {
     Kernel,
 }
 
+
+pub struct AppIsolatedNonvolatileRegion {
+    offset: usize, 
+    length: usize
+}
+
 pub struct App {
     pending_command: bool,
     command: IsolatedNonvolatileCommand,
     offset: usize,
     length: usize,
+    region: Option<AppIsolatedNonvolatileRegion>
 }
 
 impl Default for App {
@@ -129,6 +138,7 @@ impl Default for App {
             command: IsolatedNonvolatileCommand::UserspaceRead,
             offset: 0,
             length: 0,
+            region: None
         }
     }
 }
@@ -171,6 +181,9 @@ pub struct IsolatedNonvolatileStorage<'a> {
     kernel_readwrite_length: Cell<usize>,
     // Where to read/write from the kernel request.
     kernel_readwrite_address: Cell<usize>,
+
+    // Offset within flash region to 
+    next_region_offset: Cell<usize>,
 }
 
 impl<'a> IsolatedNonvolatileStorage<'a> {
@@ -203,6 +216,7 @@ impl<'a> IsolatedNonvolatileStorage<'a> {
             kernel_buffer: TakeCell::empty(),
             kernel_readwrite_length: Cell::new(0),
             kernel_readwrite_address: Cell::new(0),
+            next_region_offset: Cell::new(0),
         }
     }
 
@@ -219,14 +233,60 @@ impl<'a> IsolatedNonvolatileStorage<'a> {
         // Do bounds check.
         match command {
             IsolatedNonvolatileCommand::UserspaceRead | IsolatedNonvolatileCommand::UserspaceWrite => {
+                // debug!("Hello from isolated nvm kernel capsule!");
                 // Userspace sees memory that starts at address 0 even if it
                 // is offset in the physical memory.
-                // TODO: check for access between apps
                 if offset >= self.userspace_length
                     || length > self.userspace_length
                     || offset + length > self.userspace_length
                 {
                     return Err(ErrorCode::INVAL);
+                }
+
+                // bounds check between apps
+                let res = processid.map_or(Err(ErrorCode::FAIL), |processid| {
+                    self.apps.enter(processid, |app, kernel_data| {
+                        // match &app.region {
+                        //     Some(region) => {
+                        //         debug!("Process {} flash region:", processid.id());
+                        //         debug!("\tOffset: {}", region.offset);
+                        //         debug!("\tLength: {}", region.length);
+                        //     },
+                        //     None => debug!("Process {} has not set up flash yet", processid.id()),
+                        // }
+                        // TODO: handle the case where we overbook and the next flash region is
+                        // too big
+                        if app.region.is_none() {
+                            const region_size: usize = TODO_CHANGE_FLASH_REGION_SIZE;
+                            app.region = Some(AppIsolatedNonvolatileRegion {
+                                offset: self.next_region_offset.get(),
+                                length: region_size,
+                            });
+                            self.next_region_offset.set(self.next_region_offset.get() + region_size);
+                        }
+                        match &app.region {
+                            Some(region) => {
+                                let region_start = region.offset;
+                                let region_end = region.offset + region.length;
+                                if offset < region_start 
+                                    || offset >= region_end 
+                                    || offset + length >= region_end 
+                                    || length > region.length 
+                                {
+                                    return Err(ErrorCode::INVAL);
+                                }
+
+                                Ok(())
+                            },
+                            // this case feels a bit redundant since app.region should never be
+                            // None since we just set it above
+                            None => return Err(ErrorCode::FAIL),
+                        }
+                    }).unwrap_or_else(|err| Err(err.into()))
+                });
+
+                if res.is_err() {
+                    return res;
                 }
             }
             IsolatedNonvolatileCommand::KernelRead | IsolatedNonvolatileCommand::KernelWrite => {
@@ -302,7 +362,7 @@ impl<'a> IsolatedNonvolatileStorage<'a> {
                                         });
                                 }
 
-                                self.userspace_call_driver(command, offset, active_len)
+                                self.userspace_call_driver(command, offset + app.region.as_ref().unwrap().offset, active_len)
                             } else {
                                 // Some app is using the storage, we must wait.
                                 if app.pending_command {
@@ -442,7 +502,7 @@ impl<'a> IsolatedNonvolatileStorage<'a> {
 /// This is the callback client for the underlying physical storage driver.
 impl hil::nonvolatile_storage::NonvolatileStorageClient for IsolatedNonvolatileStorage<'_> {
     fn read_done(&self, buffer: &'static mut [u8], length: usize) {
-        debug!("finished reading");
+        // debug!("finished reading");
         // Switch on which user of this capsule generated this callback.
         self.current_user.take().map(|user| {
             match user {
@@ -521,6 +581,7 @@ impl<'a> hil::nonvolatile_storage::NonvolatileStorage<'a> for IsolatedNonvolatil
         address: usize,
         length: usize,
     ) -> Result<(), ErrorCode> {
+        // debug!("entered read");
         self.kernel_buffer.replace(buffer);
         self.enqueue_command(IsolatedNonvolatileCommand::KernelRead, address, length, None)
     }
