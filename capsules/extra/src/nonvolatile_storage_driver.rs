@@ -62,7 +62,7 @@ use core::cell::Cell;
 use core::cmp;
 
 use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
-use kernel::{debug, hil};
+use kernel::hil;
 use kernel::processbuffer::{ReadableProcessBuffer, WriteableProcessBuffer};
 use kernel::syscall::{CommandReturn, SyscallDriver};
 use kernel::utilities::cells::{OptionalCell, TakeCell};
@@ -284,21 +284,10 @@ impl<'a> NonvolatileStorage<'a> {
             self.apps.enter(processid, |app, _kernel_data| {
                 match &app.region {
                     Some(app_region) => {
-                        debug!("Trying to access offset {} and length {}; Userspace offset {} and length {}. App region offset {} and length {}",
-                            offset,
-                            length,
-                            self.userspace_start_address,
-                            self.userspace_length,
-                            app_region.offset,
-                            app_region.length);
-                        // let app_region_start = app_region.offset;
-                        // let app_region_end = app_region.offset + app_region.length;
-
                         if  offset >= app_region.length 
                             || length > app_region.length 
                             || offset + length >= app_region.length
                         {
-                            debug!("out of range for userspace access");
                             return Err(ErrorCode::INVAL);
                         }
 
@@ -422,7 +411,6 @@ impl<'a> NonvolatileStorage<'a> {
                                     Some(region) => region.offset,
                                     None => return Err(ErrorCode::FAIL),
                                 }; 
-                                debug!("performing access at {} for length {}", app_region_start + offset, active_len);
 
                                 // Userspace accesses start at 0 which is the start of the app's region.
                                 self.userspace_call_driver(command, app_region_start + offset, active_len)
