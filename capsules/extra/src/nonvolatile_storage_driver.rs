@@ -399,13 +399,12 @@ impl<'a> NonvolatileStorage<'a> {
                                         });
                                 }
 
-                                let app_region_start = match &app.region {
-                                    Some(region) => region.offset,
-                                    None => return Err(ErrorCode::FAIL),
-                                }; 
+                                let Some(app_region) = &app.region else {
+                                    return Err(ErrorCode::FAIL);
+                                };
 
                                 // Userspace accesses start at 0 which is the start of the app's region.
-                                self.userspace_call_driver(command, app_region_start + offset, active_len)
+                                self.userspace_call_driver(command, app_region.offset + offset, active_len)
                             } else {
                                 // Some app is using the storage, we must wait.
                                 if app.pending_command {
