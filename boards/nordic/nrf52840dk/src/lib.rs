@@ -250,7 +250,7 @@ pub struct Platform {
     scheduler: &'static RoundRobinSched<'static>,
     systick: cortexm4::systick::SysTick,
     nonvolatile_storage:
-        &'static capsules_extra::isolated_nonvolatile_storage_driver::IsolatedNonvolatileStorage<'static>,
+        &'static capsules_extra::nonvolatile_storage_driver::NonvolatileStorage<'static>,
 }
 
 impl SyscallDriverLookup for Platform {
@@ -277,7 +277,7 @@ impl SyscallDriverLookup for Platform {
             capsules_core::spi_controller::DRIVER_NUM => f(Some(self.spi_controller)),
             capsules_extra::net::thread::driver::DRIVER_NUM => f(Some(self.thread_driver)),
             capsules_extra::kv_driver::DRIVER_NUM => f(Some(self.kv_driver)),
-            capsules_extra::isolated_nonvolatile_storage_driver::DRIVER_NUM => f(Some(self.nonvolatile_storage)),
+            capsules_extra::nonvolatile_storage_driver::DRIVER_NUM => f(Some(self.nonvolatile_storage)),
             _ => f(None),
         }
     }
@@ -898,6 +898,7 @@ pub unsafe fn start() -> (
     //--------------------------------------------------------------------------
     // NONVOLATILE STORAGE
     //--------------------------------------------------------------------------
+    const NONVOLATILE_REGION_SIZE_PER_APP: usize = 2048; 
 
     // Kernel storage region, allocated with the storage_volume!
     // macro in common/utils.rs
@@ -910,17 +911,18 @@ pub unsafe fn start() -> (
     // 32kB of userspace-accessible storage, page aligned:
     kernel::storage_volume!(APP_STORAGE, 32);
 
-    let isolated_nonvolatile_storage = components::isolated_nonvolatile_storage::IsolatedNonvolatileStorageComponent::new(
+    let nonvolatile_storage = components::nonvolatile_storage::NonvolatileStorageComponent::new(
         board_kernel,
-        capsules_extra::isolated_nonvolatile_storage_driver::DRIVER_NUM,
+        capsules_extra::nonvolatile_storage_driver::DRIVER_NUM,
         &nrf52840_peripherals.nrf52.nvmc,
         // TODO: temporarily storing this in kernel buffer. need to move somewhere else...
         core::ptr::addr_of!(APP_STORAGE) as usize,
         APP_STORAGE.len(),
         core::ptr::null::<()>() as usize,
-        0
+        0,
+        NONVOLATILE_REGION_SIZE_PER_APP
     )
-    .finalize(components::isolated_nonvolatile_storage_component_static!(
+    .finalize(components::nonvolatile_storage_component_static!(
         nrf52840::nvmc::Nvmc
     ));
 
@@ -953,7 +955,7 @@ pub unsafe fn start() -> (
         kv_driver,
         scheduler,
         systick: cortexm4::systick::SysTick::new_with_calibration(64000000),
-        nonvolatile_storage: isolated_nonvolatile_storage,
+        nonvolatile_storage,
     };
 
     let _ = platform.pconsole.start();
