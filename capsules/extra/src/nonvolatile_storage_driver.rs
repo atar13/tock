@@ -116,6 +116,7 @@ pub enum NonvolatileUser {
 
 /// Describes a region of nonvolatile memory that is assigned to a
 /// certain app. 
+#[derive(Clone, Copy)]
 pub struct NonvolatileAppRegion {
     /// Absolute address to describe where an app's nonvolatile region
     /// starts.
@@ -189,7 +190,7 @@ pub struct NonvolatileStorage<'a> {
     // to an app yet. Each time an app uses this capsule, a new
     // region of storage will be handed out and this address will
     // point to a new unallocated region. 
-    start_address_unallocated_app_region: Cell<usize>,
+    next_app_region_start_address: Cell<usize>,
 }
 
 impl<'a> NonvolatileStorage<'a> {
@@ -224,22 +225,24 @@ impl<'a> NonvolatileStorage<'a> {
             kernel_readwrite_length: Cell::new(0),
             kernel_readwrite_address: Cell::new(0),
             app_region_size: app_region_size,
-            start_address_unallocated_app_region: Cell::new(userspace_start_address),
+            next_app_region_start_address: Cell::new(userspace_start_address),
         }
     }
 
-    fn assign_app_region(&self, processid: ProcessId) -> Result<(), ErrorCode> {
-        let res = self.apps.enter(processid, |app, _kernel_data| {
-            // if this app's region is already allocated, we're good
-            if app.region.is_some() { 
-                return Ok(());
-            }
+    fn has_app_region(&self, processid: ProcessId) -> Result<bool, ErrorCode> {
+        // Check if the given app's nonvolatile storage region has been assigned yet
+        self.apps.enter(processid, |app, _kernel_data| {
+            Ok(app.region.is_some())
+        }).unwrap_or(Err(ErrorCode::FAIL))
+    }
 
+    fn assign_app_region(&self, processid: ProcessId) -> Result<(), ErrorCode> {
+        self.apps.enter(processid, |app, _kernel_data| {
             // check that allocating the next region of flash won't go over
             // the userspace boundaries
             let userspace_end = self.userspace_start_address + self.userspace_length;
-            let new_region_start = self.start_address_unallocated_app_region.get();
-            let new_region_end = self.start_address_unallocated_app_region.get() + self.app_region_size;
+            let new_region_start = self.next_app_region_start_address.get();
+            let new_region_end = self.next_app_region_start_address.get() + self.app_region_size;
 
             if new_region_start < self.userspace_start_address ||
                 new_region_start >= userspace_end || 
@@ -249,21 +252,16 @@ impl<'a> NonvolatileStorage<'a> {
             }
 
             app.region = Some(NonvolatileAppRegion{
-                offset: new_region_start,
+                offset: self.next_app_region_start_address.get(),
                 length: self.app_region_size
             });
-            Ok(())
-        });
 
-        match res {
-            // handle failure to allocate new region
-            Ok(closure_res) => match closure_res {
-                Ok(_) => Ok(()),
-                Err(e) => Err(e)
-            },
-            // handle failure to enter the grant 
-            Err(_) => Err(ErrorCode::FAIL),
-        }
+            // increase next_app_region_start_address to be at the correct offset 
+            // for the next app
+            self.next_app_region_start_address.set(self.next_app_region_start_address.get() + self.app_region_size);
+
+            Ok(())
+        }).unwrap_or(Err(ErrorCode::FAIL))
     }
 
     fn check_userspace_access(&self, offset: usize, length: usize, processid: Option<ProcessId>) -> Result<(), ErrorCode> {
@@ -278,7 +276,7 @@ impl<'a> NonvolatileStorage<'a> {
         // check that access is within this app's isolated nonvolatile region. 
         // this is to prevent an app from reading/writing to another app's
         // nonvolatile storage.
-        let res = processid.map_or(Err(ErrorCode::FAIL), |processid| {
+        processid.map_or(Err(ErrorCode::FAIL), |processid| {
             // enter the grant to query what the app's 
             // nonvolatile region is
             self.apps.enter(processid, |app, _kernel_data| {
@@ -298,13 +296,7 @@ impl<'a> NonvolatileStorage<'a> {
                     None => return Err(ErrorCode::FAIL),
                 }
             }).unwrap_or_else(|err| Err(err.into()))
-        });
-
-        if res.is_err() {
-            return res;
-        }
-
-        Ok(())
+        })
     }
 
     fn check_kernel_access(&self, offset: usize, length: usize) -> Result<(), ErrorCode> {
@@ -655,7 +647,7 @@ impl SyscallDriver for NonvolatileStorage<'_> {
     /// ### `command_num`
     ///
     /// - `0`: Return Ok(()) if this driver is included on the platform.
-    /// - `1`: Return the number of bytes available to userspace.
+    /// - `1`: Return the number of bytes available to each app.
     /// - `2`: Start a read from the nonvolatile storage.
     /// - `3`: Start a write to the nonvolatile_storage.
     fn command(
@@ -665,31 +657,36 @@ impl SyscallDriver for NonvolatileStorage<'_> {
         length: usize,
         processid: ProcessId,
     ) -> CommandReturn {
-        match self.assign_app_region(processid) {
-            Ok(()) => (),
+        // Assign each app to a region of nonvolatile storage if it hasn't
+        // been assigned one yet. This is done at the start of the syscall
+        // driver to ensure that any apps that interact with this
+        // capsule will get assigned a region.
+        let has_region = match self.has_app_region(processid) {
+            Ok(has_region) => has_region,
             Err(e) => return CommandReturn::failure(e),
+        };
+        if !has_region {
+            let res = self.assign_app_region(processid);
+            if let Err(e) = res {
+                return CommandReturn::failure(e);
+            }
         }
 
         match command_num {
             0 => CommandReturn::success(),
 
             1 => {
-                // How many bytes are accessible from userspace
-                let res = self.apps.enter(processid, |app, _kernel_data| {
-                    match &app.region {
-                        Some(region) => Some(region.length),
-                        None => None,
-                    }
-                });
+                // How many bytes are accessible to each app 
+                let res = self.apps.enter(processid, |app, _kernel_data| { app.region });
 
-                match res {
-                    Ok(region_length) => match region_length {
+                // handle case where we fail to enter grant
+                res.map_or(CommandReturn::failure(ErrorCode::FAIL), |region| {
+                    // handle case where app's region is not assigned
+                    region.map_or(CommandReturn::failure(ErrorCode::FAIL), |region| {
                         // TODO: Would break on 64-bit platforms
-                        Some(bytes) => CommandReturn::success_u32(bytes as u32),
-                        None => CommandReturn::failure(ErrorCode::FAIL),
-                    },
-                    Err(_) => CommandReturn::failure(ErrorCode::FAIL),
-                }
+                        CommandReturn::success_u32(region.length as u32)
+                    })
+                })
             }
 
             2 => {
