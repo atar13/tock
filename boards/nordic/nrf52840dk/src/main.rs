@@ -136,7 +136,7 @@ pub unsafe fn main() {
     board_kernel.kernel_loop(
         &platform,
         chip,
-        Some(&platform.base.ipc),
+        None::<&kernel::ipc::IPC<8>>,
         &main_loop_capability,
     );
 }
