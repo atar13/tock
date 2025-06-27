@@ -129,6 +129,8 @@ pub fn parse_tbf_header(
                 let mut storage_permissions_pointer: Option<&'static [u8]> = None;
                 let mut kernel_version: Option<types::TbfHeaderV2KernelVersion> = None;
                 let mut short_id: Option<types::TbfHeaderV2ShortId> = None;
+                let mut shared_library: Option<types::TbfHeaderV2SharedLibrary> = None;
+                let mut shared_library_deps: [Option<&'static str>; types::NUM_SHLIB_DEPS] = [None; 4];
 
                 // Iterate the remainder of the header looking for TLV entries.
                 while remaining.len() > 0 {
@@ -272,7 +274,45 @@ pub fn parse_tbf_header(
                                 ));
                             }
                         }
+                        types::TbfHeaderTypes::TbfHeaderSharedLibrary => {
+                            let entry_len = mem::size_of::<types::TbfHeaderV2SharedLibrary>();
+                            // panic!("TLV HEADER LENGTH {} vs {}", tlv_header.length, entry_len);
 
+                            // parse first statically sized part of header
+                            shared_library = Some(
+                                remaining
+                                    .get(0..entry_len)
+                                    .ok_or(types::TbfParseError::NotEnoughFlash)?
+                                    .try_into()?,
+                            );
+
+                            // parse dynamically sized part of header to get names 
+                            // of shared library dependencies
+                            let deps_buf = 
+                                remaining.get(entry_len..tlv_header.length as usize)
+                                .ok_or(types::TbfParseError::NotEnoughFlash)?;
+
+                            let mut curr_dep_num = 0;
+                            let mut curr_dep_start_pos = 0;
+                            for (i, ch) in deps_buf.iter().enumerate() {
+                                if curr_dep_num > types::NUM_SHLIB_DEPS {
+                                    break;
+                                }
+
+                                // reached the end of a dep string
+                                if *ch as char == '\0' {
+                                    // save this string in a slot of the slice 
+                                    let dep_name_buf = deps_buf.get(curr_dep_start_pos..i).
+                                        ok_or(types::TbfParseError::NotEnoughFlash)?;
+                                    let dep_name = str::from_utf8(dep_name_buf)
+                                        .or(Err(types::TbfParseError::BadProcessName))?;
+                                    shared_library_deps[curr_dep_num] = Some(dep_name);
+
+                                    curr_dep_num += 1;
+                                    curr_dep_start_pos = i + 1;
+                                }
+                            }
+                        }
                         _ => {}
                     }
 
@@ -297,6 +337,8 @@ pub fn parse_tbf_header(
                     storage_permissions: storage_permissions_pointer,
                     kernel_version,
                     short_id,
+                    shared_library,
+                    shared_library_deps,
                 };
 
                 Ok(types::TbfHeader::TbfHeaderV2(tbf_header))

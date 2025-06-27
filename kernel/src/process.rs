@@ -16,19 +16,20 @@ use crate::ipc;
 use crate::kernel::Kernel;
 use crate::platform::mpu::{self};
 use crate::processbuffer::{ReadOnlyProcessBuffer, ReadWriteProcessBuffer};
+use crate::shared_library::SharedLibrary;
 use crate::storage_permissions;
 use crate::syscall::{self, Syscall, SyscallReturn};
 use crate::upcall::UpcallId;
 use crate::utilities::capability_ptr::CapabilityPtr;
-use tock_tbf::types::CommandPermissions;
+use tock_tbf::types::{CommandPermissions, NUM_SHLIB_DEPS};
 
 // Export all process related types via `kernel::process::`.
 pub use crate::process_binary::ProcessBinary;
 pub use crate::process_checker::AcceptedCredential;
 pub use crate::process_checker::{ProcessCheckerMachine, ProcessCheckerMachineClient};
-pub use crate::process_loading::load_processes;
 pub use crate::process_loading::ProcessLoadError;
 pub use crate::process_loading::SequentialProcessLoaderMachine;
+pub use crate::process_loading::{load_libraries, load_processes};
 pub use crate::process_loading::{ProcessLoadingAsync, ProcessLoadingAsyncClient};
 pub use crate::process_policies::{ProcessFaultPolicy, ProcessStandardStoragePermissionsPolicy};
 pub use crate::process_printer::{ProcessPrinter, ProcessPrinterContext};
@@ -351,6 +352,13 @@ pub trait Process {
 
     /// Get the name of the process. Used for IPC.
     fn get_process_name(&self) -> &'static str;
+
+    /// Get the names of shared libraries this process requires.
+    fn get_shared_library_deps(&self) -> [Option<SharedLibrary>; NUM_SHLIB_DEPS];
+
+    /// Get the memory addresses where each shared library is loaded in RAM
+    /// for this process. Tuples of (start_addr, size).
+    fn get_shared_library_ram_addresses(&self) -> [Option<(*const u8, usize)>; NUM_SHLIB_DEPS];
 
     /// Return if there are any Tasks (upcalls/IPC requests) enqueued for the
     /// process.
@@ -1160,6 +1168,8 @@ pub struct ProcessAddresses {
     /// have reached a lower address, this is only the lowest address seen when
     /// the process calls a syscall.
     pub sram_stack_bottom: Option<usize>,
+    /// The start address of the shared library region, if any.
+    pub sram_shlib_start: Option<usize>,
 }
 
 /// Collection of process state related to the size in memory of various process

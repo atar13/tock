@@ -144,6 +144,13 @@ pub const NUM_PROCS: usize = 8;
 pub static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS] =
     [None; NUM_PROCS];
 
+/// Number of shared libraries this platform supports.
+pub const NUM_SHLIBS: usize = 4;
+
+/// Shared library array of this platform.
+pub static mut SHARED_LIBRARIES: [Option<kernel::shared_library::SharedLibrary>; NUM_SHLIBS] =
+    [const { None }; NUM_SHLIBS];
+
 static mut CHIP: Option<&'static nrf52840::chip::NRF52<Nrf52840DefaultPeripherals>> = None;
 static mut PROCESS_PRINTER: Option<&'static capsules_system::process_printer::ProcessPrinterText> =
     None;

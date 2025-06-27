@@ -26,6 +26,7 @@ pub enum NUM {
 
     // Kernel
     Ipc                   = 0x10000,
+    SharedLibraryInfo     = 0x10001,
 
     // HW Buses
     Spi                   = 0x20001,

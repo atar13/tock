@@ -7,6 +7,9 @@
 use core::fmt;
 use core::mem::size_of;
 
+/// Number of shared libraries an application is permitted to depend on
+pub const NUM_SHLIB_DEPS: usize = 4;
+
 /// We only support up to a fixed number of storage permissions for each of read
 /// and modify. This simplification enables us to use fixed sized buffers.
 const NUM_STORAGE_PERMISSIONS: usize = 8;
@@ -131,6 +134,7 @@ pub enum TbfHeaderTypes {
     TbfHeaderKernelVersion = 8,
     TbfHeaderProgram = 9,
     TbfHeaderShortId = 10,
+    TbfHeaderSharedLibrary = 11,
     TbfFooterCredentials = 128,
 
     /// Some field in the header that we do not understand. Since the TLV format
@@ -250,6 +254,11 @@ pub struct TbfHeaderV2ShortId {
     short_id: Option<core::num::NonZeroU32>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct TbfHeaderV2SharedLibrary {
+    is_shared_library: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TbfFooterV2CredentialsType {
     Reserved = 0,
@@ -330,6 +339,7 @@ impl core::convert::TryFrom<u16> for TbfHeaderTypes {
             8 => Ok(TbfHeaderTypes::TbfHeaderKernelVersion),
             9 => Ok(TbfHeaderTypes::TbfHeaderProgram),
             10 => Ok(TbfHeaderTypes::TbfHeaderShortId),
+            11 => Ok(TbfHeaderTypes::TbfHeaderSharedLibrary),
             128 => Ok(TbfHeaderTypes::TbfFooterCredentials),
             _ => Ok(TbfHeaderTypes::Unknown),
         }
@@ -588,6 +598,20 @@ impl core::convert::TryFrom<&[u8]> for TbfHeaderV2ShortId {
     }
 }
 
+impl core::convert::TryFrom<&[u8]> for TbfHeaderV2SharedLibrary {
+    type Error = TbfParseError;
+
+    fn try_from(b: &[u8]) -> Result<TbfHeaderV2SharedLibrary, Self::Error> {
+        Ok(TbfHeaderV2SharedLibrary {
+            is_shared_library: u32::from_le_bytes(
+                b.get(0..4)
+                .ok_or(TbfParseError::InternalError)?
+                .try_into()?,
+            )
+        })
+    }
+}
+
 impl core::convert::TryFrom<&'static [u8]> for TbfFooterV2Credentials {
     type Error = TbfParseError;
 
@@ -661,6 +685,8 @@ pub struct TbfHeaderV2 {
     pub(crate) storage_permissions: Option<&'static [u8]>,
     pub(crate) kernel_version: Option<TbfHeaderV2KernelVersion>,
     pub(crate) short_id: Option<TbfHeaderV2ShortId>,
+    pub(crate) shared_library: Option<TbfHeaderV2SharedLibrary>,
+    pub(crate) shared_library_deps: [Option<&'static str>; NUM_SHLIB_DEPS]
 }
 
 /// Type that represents the fields of the Tock Binary Format header.
@@ -669,7 +695,7 @@ pub struct TbfHeaderV2 {
 /// in the tock binary, as well as other information about the application.
 /// The kernel can also use this header to keep persistent state about
 /// the application.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum TbfHeader {
     TbfHeaderV2(TbfHeaderV2),
     Padding(TbfHeaderV2Base),
@@ -1020,6 +1046,22 @@ impl TbfHeader {
         match self {
             TbfHeader::TbfHeaderV2(hd) => hd.short_id.map_or(None, |si| si.short_id),
             _ => None,
+        }
+    }
+
+    /// Return if the application is a shared library or not
+    pub fn is_shared_library(&self) -> Option<bool> {
+        match self {
+            TbfHeader::TbfHeaderV2(hd) => hd.shared_library.map_or(None, |sh| Some(sh.is_shared_library == 1)), 
+            _ => None,
+        }
+    }
+
+    /// Return if the application is a shared library or not
+    pub fn get_shared_library_deps(&self) -> [Option<&'static str>; NUM_SHLIB_DEPS] {
+        match self {
+            TbfHeader::TbfHeaderV2(hd) => hd.shared_library_deps,
+            _ => [None; NUM_SHLIB_DEPS],
         }
     }
 }

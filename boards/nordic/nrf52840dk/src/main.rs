@@ -10,12 +10,14 @@
 #![cfg_attr(not(doc), no_main)]
 #![deny(missing_docs)]
 
-use core::ptr::addr_of_mut;
+use core::ptr::{addr_of, addr_of_mut};
 
 use kernel::debug;
 use kernel::platform::{KernelResources, SyscallDriverLookup};
+use kernel::shared_library_lookup;
+use kernel::static_init;
 use kernel::{capabilities, create_capability};
-use nrf52840dk_lib::{self, PROCESSES};
+use nrf52840dk_lib::{self, PROCESSES, SHARED_LIBRARIES};
 
 // State for loading and holding applications.
 // How should the kernel respond when a process faults.
@@ -27,6 +29,7 @@ struct Platform {
     eui64_driver: &'static nrf52840dk_lib::Eui64Driver,
     ieee802154_driver: &'static nrf52840dk_lib::Ieee802154Driver,
     udp_driver: &'static capsules_extra::net::udp::UDPDriver<'static>,
+    shared_library_lookup: &'static crate::shared_library_lookup::SharedLibraryLookup,
 }
 
 impl SyscallDriverLookup for Platform {
@@ -38,6 +41,7 @@ impl SyscallDriverLookup for Platform {
             capsules_extra::eui64::DRIVER_NUM => f(Some(self.eui64_driver)),
             capsules_extra::net::udp::DRIVER_NUM => f(Some(self.udp_driver)),
             capsules_extra::ieee802154::DRIVER_NUM => f(Some(self.ieee802154_driver)),
+            kernel::shared_library_lookup::DRIVER_NUM => f(Some(self.shared_library_lookup)),
             _ => self.base.with_driver(driver_num, f),
         }
     }
@@ -91,11 +95,17 @@ pub unsafe fn main() {
     let (eui64_driver, ieee802154_driver, udp_driver) =
         nrf52840dk_lib::ieee802154_udp(board_kernel, default_peripherals, mux_alarm);
 
+    let shared_library_lookup = static_init!(
+        shared_library_lookup::SharedLibraryLookup,
+        shared_library_lookup::SharedLibraryLookup::new(&*addr_of!(PROCESSES))
+    );
+
     let platform = Platform {
         base: base_platform,
         eui64_driver,
         ieee802154_driver,
         udp_driver,
+        shared_library_lookup,
     };
 
     // These symbols are defined in the linker script.
@@ -124,6 +134,7 @@ pub unsafe fn main() {
             core::ptr::addr_of!(_eappmem) as usize - core::ptr::addr_of!(_sappmem) as usize,
         ),
         &mut *addr_of_mut!(PROCESSES),
+        &mut *addr_of_mut!(SHARED_LIBRARIES),
         &FAULT_RESPONSE,
         &process_management_capability,
     )

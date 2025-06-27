@@ -99,6 +99,8 @@ impl ProcessPrinter for ProcessPrinterText {
             None => bww.write_str(" Completion Code: None\r\n"),
         };
 
+        let _ = bww.write_fmt(format_args!("Shared library starts at {:#010X}", addresses.sram_shlib_start.unwrap()));
+
         let _ = bww.write_fmt(format_args!(
             "\
                  \r\n\

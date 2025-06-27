@@ -606,6 +606,10 @@ unsafe fn start() -> (
 
     // These symbols are defined in the linker script.
     extern "C" {
+        /// Beginning of the ROM region containing shared libraries.
+        static _slibs: u8;
+        /// End of the ROM region containing shared libraries.
+        static _elibs: u8;
         /// Beginning of the ROM region containing app images.
         static _sapps: u8;
         /// End of the ROM region containing app images.
@@ -615,6 +619,26 @@ unsafe fn start() -> (
         /// End of the RAM region for app memory.
         static _eappmem: u8;
     }
+
+    kernel::process::load_libraries(
+        board_kernel,
+        chip,
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!(_slibs),
+            core::ptr::addr_of!(_elibs) as usize - core::ptr::addr_of!(_slibs) as usize,
+        ),
+        core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(_sappmem),
+            core::ptr::addr_of!(_eappmem) as usize - core::ptr::addr_of!(_sappmem) as usize,
+        ),
+        &mut *addr_of_mut!(PROCESSES),
+        &FAULT_RESPONSE,
+        &process_management_capability,
+    )
+    .unwrap_or_else(|err| {
+        debug!("Error loading libraries!");
+        debug!("{:?}", err);
+    });
 
     kernel::process::load_processes(
         board_kernel,

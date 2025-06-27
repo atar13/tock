@@ -16,8 +16,7 @@ use core::{mem, ptr, slice, str};
 
 use crate::collections::queue::Queue;
 use crate::collections::ring_buffer::RingBuffer;
-use crate::config;
-use crate::debug;
+use crate::debug::debug_print;
 use crate::errorcode::ErrorCode;
 use crate::kernel::Kernel;
 use crate::platform::chip::Chip;
@@ -33,13 +32,15 @@ use crate::process_loading::ProcessLoadError;
 use crate::process_policies::ProcessFaultPolicy;
 use crate::process_policies::ProcessStandardStoragePermissionsPolicy;
 use crate::processbuffer::{ReadOnlyProcessBuffer, ReadWriteProcessBuffer};
+use crate::shared_library::SharedLibrary;
 use crate::storage_permissions::StoragePermissions;
 use crate::syscall::{self, Syscall, SyscallReturn, UserspaceKernelBoundary};
 use crate::upcall::UpcallId;
 use crate::utilities::capability_ptr::{CapabilityPtr, CapabilityPtrPermissions};
 use crate::utilities::cells::{MapCell, NumericCellExt, OptionalCell};
+use crate::{config, debug};
 
-use tock_tbf::types::CommandPermissions;
+use tock_tbf::types::{CommandPermissions, NUM_SHLIB_DEPS};
 
 /// Interface supported by [`ProcessStandard`] for recording debug information.
 ///
@@ -411,6 +412,11 @@ pub struct ProcessStandard<'a, C: 'static + Chip, D: 'static + ProcessStandardDe
     /// Number of bytes of memory allocated to this process.
     memory_len: usize,
 
+    /// Memory regions where each shared library is loaded in RAM for this
+    /// process.
+    /// Tuples of (start_addr, size)
+    shlib_mem_regions: [Option<(*const u8, usize)>; NUM_SHLIB_DEPS],
+
     /// Reference to the slice of `GrantPointerEntry`s stored in the process's
     /// memory reserved for the kernel. These driver numbers are zero and
     /// pointers are null if the grant region has not been allocated. When the
@@ -444,6 +450,8 @@ pub struct ProcessStandard<'a, C: 'static + Chip, D: 'static + ProcessStandardDe
     /// Credential that was approved for this process, or `None` if the
     /// credential was permitted to run without an accepted credential.
     credential: Option<AcceptedCredential>,
+
+    shlib_deps: [Option<SharedLibrary>; NUM_SHLIB_DEPS],
 
     /// State saved on behalf of the process each time the app switches to the
     /// kernel.
@@ -1251,6 +1259,14 @@ impl<C: Chip, D: 'static + ProcessStandardDebug> Process for ProcessStandard<'_,
         self.header.get_package_name().unwrap_or("")
     }
 
+    fn get_shared_library_deps(&self) -> [Option<SharedLibrary>; NUM_SHLIB_DEPS] {
+        self.shlib_deps
+    }
+
+    fn get_shared_library_ram_addresses(&self) -> [Option<(*const u8, usize)>; NUM_SHLIB_DEPS] {
+        self.shlib_mem_regions
+    }
+
     fn get_completion_code(&self) -> Option<Option<u32>> {
         self.completion_code.get()
     }
@@ -1414,6 +1430,7 @@ impl<C: Chip, D: 'static + ProcessStandardDebug> Process for ProcessStandard<'_,
             sram_heap_start: self.debug.get_app_heap_start_pointer().map(|p| p as usize),
             sram_stack_top: self.debug.get_app_stack_start_pointer().map(|p| p as usize),
             sram_stack_bottom: self.debug.get_app_stack_min_pointer().map(|p| p as usize),
+            sram_shlib_start: Some(self.kernel_memory_break() as usize - 0x1000),
         }
     }
 
@@ -1430,6 +1447,34 @@ impl<C: Chip, D: 'static + ProcessStandardDebug> Process for ProcessStandard<'_,
         if !config::CONFIG.debug_panics {
             return;
         }
+
+        unsafe {
+            let _ = writer.write_str("Process memory dump:\n");
+            for i in (0..self.memory_len).step_by(16) {
+                if (i + self.mem_start() as usize) < 0x20009000 {
+                    continue;
+                }
+                if i + self.mem_start() as usize > 0x2000A000 {
+                    break;
+                }
+                let _ = writer.write_fmt(format_args!("0x{:08X}: ", i + self.mem_start() as usize));
+                for j in i..(16 + i) {
+                    if j > self.memory_len - 1 {
+                        break;
+                    }
+                    let j = j as isize;
+                    let _ =
+                        writer.write_fmt(format_args!(" {:02X} ", *(self.mem_start().offset(j))));
+                }
+                let _ = writer.write_str("\n");
+            }
+        }
+        let _ = writer.write_fmt(format_args!(
+            "Process memory dump 0x{:08X}-0x{:08X}, len: {}:\n",
+            self.mem_start() as usize,
+            self.mem_end() as usize,
+            self.memory_len
+        ));
 
         self.stored_state.map(|stored_state| {
             // We guarantee the memory bounds pointers provided to the UKB are
@@ -1541,6 +1586,7 @@ impl<C: 'static + Chip, D: 'static + ProcessStandardDebug> ProcessStandard<'_, C
         kernel: &'static Kernel,
         chip: &'static C,
         pb: ProcessBinary,
+        shlib_deps: [Option<SharedLibrary>; NUM_SHLIB_DEPS],
         remaining_memory: &'a mut [u8],
         fault_policy: &'static dyn ProcessFaultPolicy,
         storage_permissions_policy: &'static dyn ProcessStandardStoragePermissionsPolicy<C, D>,
@@ -1550,6 +1596,29 @@ impl<C: 'static + Chip, D: 'static + ProcessStandardDebug> ProcessStandard<'_, C
     {
         let process_name = pb.header.get_package_name();
         let process_ram_requested_size = pb.header.get_minimum_app_ram_size() as usize;
+        debug!(
+            "App {} requests {:#x} bytes of RAM",
+            process_name.unwrap_or("???"),
+            process_ram_requested_size
+        );
+
+        for shlib in shlib_deps.iter() {
+            if let Some(shlib) = shlib {
+                if let Some(name) = shlib.header.get_package_name() {
+                    debug!(
+                        "App {} depends on shared library: {}",
+                        process_name.unwrap_or("???"),
+                        name
+                    );
+                    debug!("\tmin_ram={}", shlib.header.get_minimum_app_ram_size());
+                } else {
+                    debug!(
+                        "App {} depends on unnamed shared library",
+                        process_name.unwrap_or("???")
+                    );
+                }
+            }
+        }
 
         // Initialize MPU region configuration.
         let mut mpu_config = match chip.mpu().new_config() {
@@ -1578,6 +1647,32 @@ impl<C: 'static + Chip, D: 'static + ProcessStandardDebug> ProcessStandard<'_, C
                     );
             }
             return Err((ProcessLoadError::MpuInvalidFlashLength, remaining_memory));
+        }
+
+        for shlib in shlib_deps.iter() {
+            if let Some(shlib) = shlib {
+                if chip
+                    .mpu()
+                    .allocate_region(
+                        shlib.flash.as_ptr(),
+                        shlib.flash.len(),
+                        shlib.flash.len(),
+                        mpu::Permissions::ReadExecuteOnly,
+                        &mut mpu_config,
+                    )
+                    .is_none()
+                {
+                    if config::CONFIG.debug_load_processes {
+                        debug!(
+                            "[!] flash={:#010X}-{:#010X} shlib={:?} - couldn't allocate MPU region for shlib flash",
+                            shlib.flash.as_ptr() as usize,
+                            shlib.flash.as_ptr() as usize + shlib.flash.len() - 1,
+                            shlib.header.get_package_name().unwrap_or("???")
+                        );
+                    }
+                    return Err((ProcessLoadError::MpuInvalidFlashLength, remaining_memory));
+                }
+            }
         }
 
         // Determine how much space we need in the application's memory space
@@ -1626,10 +1721,24 @@ impl<C: 'static + Chip, D: 'static + ProcessStandardDebug> ProcessStandard<'_, C
         // much larger than `min_process_memory_size`), as they are unlikely to
         // work with essentially no available memory. But, we still must protect
         // for that case.
+        debug!("Process requested {:#x}", process_ram_requested_size);
+        debug!("Min processor memory size {:#x}", min_process_memory_size);
         let min_process_ram_size = cmp::max(process_ram_requested_size, min_process_memory_size);
+        debug!("Min process RAM size {:#x}", min_process_ram_size);
+
+        let min_shared_libraries_ram_size = shlib_deps.iter().fold(0, |acc, shlib| {
+            if let Some(shlib) = shlib {
+                acc + shlib.header.get_minimum_app_ram_size() as usize
+            } else {
+                acc
+            }
+        });
 
         // Minimum memory size for the process.
-        let min_total_memory_size = min_process_ram_size + initial_kernel_memory_size;
+        let min_total_memory_size =
+            min_process_ram_size + initial_kernel_memory_size + min_shared_libraries_ram_size;
+        // let min_total_memory_size = min_process_ram_size + initial_kernel_memory_size;
+        debug!("Min total RAM size {:#x}", min_total_memory_size);
 
         // Check if this process requires a fixed memory start address. If so,
         // try to adjust the memory region to work for this process.
@@ -1715,6 +1824,11 @@ impl<C: 'static + Chip, D: 'static + ProcessStandardDebug> ProcessStandard<'_, C
                 return Err((ProcessLoadError::NotEnoughMemory, remaining_memory));
             }
         };
+        debug!(
+            "MPU chose {:#010X}-{:#010X} for app",
+            allocation_start as usize,
+            (allocation_start as usize + allocation_size)
+        );
 
         // Determine the offset of the app-owned part of the above memory
         // allocation. An MPU may not place it at the very start of
@@ -1791,9 +1905,44 @@ impl<C: 'static + Chip, D: 'static + ProcessStandardDebug> ProcessStandard<'_, C
         let (allocated_padded_memory, unused_memory) =
             remaining_memory.split_at_mut(app_memory_start_offset + allocation_size);
 
+        debug!(
+            "Unused memory {:#x}-{:#x}",
+            unused_memory.as_ptr() as usize,
+            (unused_memory.as_ptr() as usize + unused_memory.len())
+        );
+
         // Now, slice off the (optional) padding at the start:
         let (_padding, allocated_memory) =
             allocated_padded_memory.split_at_mut(app_memory_start_offset);
+
+        let shlib_mem = match chip.mpu().allocate_region(
+            unused_memory.as_ptr(),
+            unused_memory.len(),
+            min_shared_libraries_ram_size,
+            mpu::Permissions::ReadWriteOnly,
+            &mut mpu_config,
+        ) {
+            Some(region) => region,
+            None => {
+                debug!("flash={:#010X}-{:#010X} process={:?} - couldn't allocate memory region for shared libraries of size >= {:#X}",
+                    pb.flash.as_ptr() as usize,
+                    pb.flash.as_ptr() as usize + pb.flash.len() - 1,
+                    process_name,
+                    min_shared_libraries_ram_size
+                );
+                // return Err((ProcessLoadError::NotEnoughMemory, remaining_memory));
+                panic!();
+            }
+        };
+
+        let (app_accessible_shlib_memory, unused_memory) =
+            unused_memory.split_at_mut(min_shared_libraries_ram_size);
+
+        debug!(
+            "MPU chose {:#010X}-{:#010X} for app shared libraries",
+            shlib_mem.start_address() as usize,
+            (shlib_mem.start_address() as usize + shlib_mem.size())
+        );
 
         // We continue to sub-slice the `allocated_memory` into
         // process-accessible and kernel-owned memory. Prior to that, store the
@@ -1801,9 +1950,22 @@ impl<C: 'static + Chip, D: 'static + ProcessStandardDebug> ProcessStandard<'_, C
         let allocated_memory_start = allocated_memory.as_ptr();
         let allocated_memory_len = allocated_memory.len();
 
+        debug!(
+            "Splitting allocated_memory {:#x}-{:#x} by {:#x}",
+            allocated_memory_start as usize,
+            (allocated_memory_start as usize + allocated_memory_len),
+            min_process_memory_size
+        );
+
         // Slice off the process-accessible memory:
         let (app_accessible_memory, allocated_kernel_memory) =
             allocated_memory.split_at_mut(min_process_memory_size);
+
+        debug!(
+            "Process accessible memory: {:#x}-{:#x}",
+            app_accessible_memory.as_ptr() as usize,
+            (app_accessible_memory.as_ptr() as usize + app_accessible_memory.len())
+        );
 
         // Set the initial process-accessible memory:
         let initial_app_brk = app_accessible_memory
@@ -1813,6 +1975,31 @@ impl<C: 'static + Chip, D: 'static + ProcessStandardDebug> ProcessStandard<'_, C
         // Set the initial allow high water mark to the start of process memory
         // since no `allow` calls have been made yet.
         let initial_allow_high_water_mark = app_accessible_memory.as_ptr();
+
+        debug!(
+            "Allocated Kernel memory: {:#x}-{:#x}",
+            allocated_kernel_memory.as_ptr() as usize,
+            (allocated_kernel_memory.as_ptr() as usize + allocated_kernel_memory.len())
+        );
+
+        debug!(
+            "Process accessible shared library memory: {:#x}-{:#x}",
+            app_accessible_shlib_memory.as_ptr() as usize,
+            (app_accessible_shlib_memory.as_ptr() as usize + app_accessible_shlib_memory.len())
+        );
+
+        let mut total_shlib_memory = app_accessible_shlib_memory;
+        // Tuples of (start_addr, size)
+        let mut shlib_mem_regions: [Option<(*const u8, usize)>; NUM_SHLIB_DEPS] =
+            [const { None }; NUM_SHLIB_DEPS];
+        for (i, shlib) in shlib_deps.iter().enumerate() {
+            if let Some(shlib) = shlib {
+                let shlib_ram_size = shlib.header.get_minimum_app_ram_size() as usize;
+                let (shlib_memory, rest) = total_shlib_memory.split_at_mut(shlib_ram_size);
+                shlib_mem_regions[i] = Some((shlib_memory.as_ptr(), shlib_ram_size));
+                total_shlib_memory = rest;
+            }
+        }
 
         // Set up initial grant region.
         //
@@ -1897,6 +2084,7 @@ impl<C: 'static + Chip, D: 'static + ProcessStandardDebug> ProcessStandard<'_, C
         process.allow_high_water_mark = Cell::new(initial_allow_high_water_mark);
         process.memory_start = allocated_memory_start;
         process.memory_len = allocated_memory_len;
+        process.shlib_mem_regions = shlib_mem_regions;
         process.header = pb.header;
         process.kernel_memory_break = Cell::new(kernel_memory_break);
         process.app_break = Cell::new(initial_app_brk);
@@ -1905,6 +2093,8 @@ impl<C: 'static + Chip, D: 'static + ProcessStandardDebug> ProcessStandard<'_, C
         process.credential = pb.credential.get();
         process.footers = pb.footers;
         process.flash = pb.flash;
+
+        process.shlib_deps = shlib_deps;
 
         process.stored_state = MapCell::new(Default::default());
         // Mark this process as approved and leave it to the kernel to start it.

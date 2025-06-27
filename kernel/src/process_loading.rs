@@ -15,6 +15,8 @@
 use core::cell::Cell;
 use core::fmt;
 
+use tock_tbf::types::NUM_SHLIB_DEPS;
+
 use crate::capabilities::ProcessManagementCapability;
 use crate::config;
 use crate::debug;
@@ -29,6 +31,8 @@ use crate::process_policies::ProcessFaultPolicy;
 use crate::process_policies::ProcessStandardStoragePermissionsPolicy;
 use crate::process_standard::ProcessStandard;
 use crate::process_standard::{ProcessStandardDebug, ProcessStandardDebugFull};
+use crate::shared_library::SharedLibrary;
+use crate::shared_library::SharedLibraryError;
 use crate::utilities::cells::{MapCell, OptionalCell};
 
 /// Errors that can occur when trying to load and create processes.
@@ -116,6 +120,28 @@ impl fmt::Debug for ProcessLoadError {
 ////////////////////////////////////////////////////////////////////////////////
 // SYNCHRONOUS PROCESS LOADING
 ////////////////////////////////////////////////////////////////////////////////
+#[inline(always)]
+pub fn load_libraries<C: Chip>(
+    kernel: &'static Kernel,
+    chip: &'static C,
+    lib_flash: &'static [u8],
+    lib_memory: &'static mut [u8],
+    mut procs: &'static mut [Option<&'static dyn Process>],
+    fault_policy: &'static dyn ProcessFaultPolicy,
+    _capability_management: &dyn ProcessManagementCapability,
+) -> Result<(), ProcessLoadError> {
+    if config::CONFIG.debug_load_processes {
+        debug!(
+            "Loading libraries from flash={:#010X}-{:#010X} into sram={:#010X}-{:#010X}",
+            lib_flash.as_ptr() as usize,
+            lib_flash.as_ptr() as usize + lib_flash.len() - 1,
+            0x0,
+            0x0,
+        );
+    }
+
+    Ok(())
+}
 
 /// Load processes into runnable process structures.
 ///
@@ -142,9 +168,12 @@ pub fn load_processes<C: Chip>(
     app_flash: &'static [u8],
     app_memory: &'static mut [u8],
     mut procs: &'static mut [Option<&'static dyn Process>],
+    mut libs: &'static mut [Option<SharedLibrary>; NUM_SHLIB_DEPS],
     fault_policy: &'static dyn ProcessFaultPolicy,
     _capability_management: &dyn ProcessManagementCapability,
 ) -> Result<(), ProcessLoadError> {
+    load_shared_libraries_from_flash(app_flash, &mut libs)?;
+
     load_processes_from_flash::<C, ProcessStandardDebugFull>(
         kernel,
         chip,
@@ -152,7 +181,15 @@ pub fn load_processes<C: Chip>(
         app_memory,
         &mut procs,
         fault_policy,
+        libs,
     )?;
+
+    let found_shlib_deps = check_shlib_dep_reqs(procs, libs);
+    if !found_shlib_deps {
+        // TODO: handle this gracefully by skiping apps that don't meet
+        // their shared library requirements.
+        panic!("Cannot execute a process which is missing its required shared library");
+    }
 
     if config::CONFIG.debug_process_credentials {
         debug!("Checking: no checking, load and run all processes");
@@ -193,6 +230,7 @@ fn load_processes_from_flash<C: Chip, D: ProcessStandardDebug + 'static>(
     app_memory: &'static mut [u8],
     procs: &mut &'static mut [Option<&'static dyn Process>],
     fault_policy: &'static dyn ProcessFaultPolicy,
+    all_libs: &'static [Option<SharedLibrary>; NUM_SHLIB_DEPS],
 ) -> Result<(), ProcessLoadError> {
     if config::CONFIG.debug_load_processes {
         debug!(
@@ -216,10 +254,13 @@ fn load_processes_from_flash<C: Chip, D: ProcessStandardDebug + 'static>(
             Ok((new_flash, process_binary)) => {
                 remaining_flash = new_flash;
 
+                let shlib_deps = process_binary.filter_shared_library_dependencies(all_libs);
+
                 let load_result = load_process::<C, D>(
                     kernel,
                     chip,
                     process_binary,
+                    shlib_deps,
                     remaining_memory,
                     ShortId::LocallyUnique,
                     index,
@@ -267,7 +308,8 @@ fn load_processes_from_flash<C: Chip, D: ProcessStandardDebug + 'static>(
                     | ProcessBinaryError::IncompatibleKernelVersion { .. }
                     | ProcessBinaryError::IncorrectFlashAddress { .. }
                     | ProcessBinaryError::NotEnabledProcess
-                    | ProcessBinaryError::Padding => {
+                    | ProcessBinaryError::Padding
+                    | ProcessBinaryError::SharedLibrary => {
                         if config::CONFIG.debug_load_processes {
                             debug!("Unable to use process binary: {:?}.", err);
                         }
@@ -280,6 +322,152 @@ fn load_processes_from_flash<C: Chip, D: ProcessStandardDebug + 'static>(
         }
     }
     Ok(())
+}
+
+#[inline(always)]
+fn load_shared_libraries_from_flash<'a>(
+    app_flash: &'static [u8],
+    libs: &mut &'a mut [Option<SharedLibrary>; NUM_SHLIB_DEPS],
+) -> Result<(), ProcessLoadError> {
+    let mut remaining_lib_flash = app_flash;
+    // Try to discover up to `libs.len()` libraries in flash.
+    let mut lib_index = 0;
+    let num_libs = libs.len();
+    while lib_index < num_libs {
+        let load_library_result = discover_shared_library(remaining_lib_flash);
+
+        match load_library_result {
+            Ok((new_flash, shared_library)) => {
+                remaining_lib_flash = new_flash;
+
+                libs[lib_index] = Some(shared_library);
+                lib_index += 1;
+            }
+            Err((new_flash, err)) => {
+                remaining_lib_flash = new_flash;
+                match err {
+                    SharedLibraryError::NotEnoughFlash | SharedLibraryError::TbfHeaderNotFound => {
+                        if config::CONFIG.debug_load_processes {
+                            debug!("No more shared libraries to load: {:?}.", err);
+                        }
+                        // No more processes to load.
+                        break;
+                    }
+
+                    SharedLibraryError::TbfHeaderParseFailure(_)
+                    | SharedLibraryError::Padding
+                    | SharedLibraryError::App => {
+                        if config::CONFIG.debug_load_processes {
+                            debug!("Unable to use shared library: {:?}.", err);
+                        }
+
+                        // Skip this binary and move to the next one.
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn discover_shared_library(
+    flash: &'static [u8],
+) -> Result<(&'static [u8], SharedLibrary), (&'static [u8], SharedLibraryError)> {
+    if config::CONFIG.debug_load_processes {
+        debug!(
+            "Looking for shared libraries in flash={:#010X}-{:#010X}",
+            flash.as_ptr() as usize,
+            flash.as_ptr() as usize + flash.len() - 1
+        );
+    }
+
+    // If this fails, not enough remaining flash to check for a lib.
+    let test_header_slice = flash
+        .get(0..8)
+        .ok_or((flash, SharedLibraryError::NotEnoughFlash))?;
+
+    // Pass the first eight bytes to tbfheader to parse out the length of
+    // the tbf header and lib. We then use those values to see if we have
+    // enough flash remaining to parse the remainder of the header.
+    //
+    // Start by converting [u8] to [u8; 8].
+    let header = test_header_slice
+        .try_into()
+        .or(Err((flash, SharedLibraryError::NotEnoughFlash)))?;
+
+    let (version, header_length, lib_length) =
+        match tock_tbf::parse::parse_tbf_header_lengths(header) {
+            Ok((v, hl, el)) => (v, hl, el),
+            Err(tock_tbf::types::InitialTbfParseError::InvalidHeader(lib_length)) => {
+                // If we could not parse the header, then we want to skip over
+                // this lib and look for the next one.
+                (0, 0, lib_length)
+            }
+            Err(tock_tbf::types::InitialTbfParseError::UnableToParse) => {
+                // Since Tock apps use a linked list, it is very possible the
+                // header we started to parse is intentionally invalid to signal
+                // the end of apps. This is ok and just means we have finished
+                // loading apps.
+                return Err((flash, SharedLibraryError::TbfHeaderNotFound));
+            }
+        };
+
+    // Now we can get a slice which only encompasses the length of flash
+    // described by this tbf header.  We will either parse this as an actual
+    // app, or skip over this region.
+    let lib_flash = flash
+        .get(0..lib_length as usize)
+        .ok_or((flash, SharedLibraryError::NotEnoughFlash))?;
+
+    // Advance the flash slice for process discovery beyond this last entry.
+    // This will be the start of where we look for a new process since Tock
+    // processes are allocated back-to-back in flash.
+    let remaining_flash = flash
+        .get(lib_flash.len()..)
+        .ok_or((flash, SharedLibraryError::NotEnoughFlash))?;
+
+    let shlib = SharedLibrary::create(lib_flash, header_length as usize, version)
+        .map_err(|e| (remaining_flash, e))?;
+
+    if config::CONFIG.debug_load_processes {
+        debug!(
+            "Found shared library {} at {:#010X} with header length of {}",
+            shlib.get_name().unwrap_or("<unnamed>"),
+            lib_flash.as_ptr() as usize,
+            header_length
+        );
+    }
+
+    Ok((remaining_flash, shlib))
+}
+
+// Check that each process has met its shared library dependency
+// requirements
+fn check_shlib_dep_reqs(
+    procs: &'static [Option<&'static dyn Process>],
+    libs: &'static [Option<SharedLibrary>],
+) -> bool {
+    for proc in procs.iter() {
+        if let Some(proc) = proc {
+            for dep in proc.get_shared_library_deps() {
+                if let Some(dep_name) = dep.as_ref().and_then(|d| d.get_name()) {
+                    let mut found_dep = false;
+                    for lib in libs {
+                        if let Some(lib_name) = lib.as_ref().and_then(|l| l.get_name()) {
+                            if lib_name == dep_name {
+                                found_dep = true;
+                            }
+                        }
+                    }
+                    if !found_dep {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -358,6 +546,7 @@ fn load_process<C: Chip, D: ProcessStandardDebug>(
     kernel: &'static Kernel,
     chip: &'static C,
     process_binary: ProcessBinary,
+    shlib_deps: [Option<SharedLibrary>; NUM_SHLIB_DEPS],
     app_memory: &'static mut [u8],
     app_id: ShortId,
     index: usize,
@@ -367,11 +556,12 @@ fn load_process<C: Chip, D: ProcessStandardDebug>(
 {
     if config::CONFIG.debug_load_processes {
         debug!(
-            "Loading: process flash={:#010X}-{:#010X} ram={:#010X}-{:#010X}",
+            "Loading: process flash={:#010X}-{:#010X} ram={:#010X}-{:#010X} of size {:#010X} bytes",
             process_binary.flash.as_ptr() as usize,
             process_binary.flash.as_ptr() as usize + process_binary.flash.len() - 1,
             app_memory.as_ptr() as usize,
-            app_memory.as_ptr() as usize + app_memory.len() - 1
+            app_memory.as_ptr() as usize + app_memory.len() - 1,
+            app_memory.len()
         );
     }
 
@@ -390,6 +580,7 @@ fn load_process<C: Chip, D: ProcessStandardDebug>(
             kernel,
             chip,
             process_binary,
+            shlib_deps,
             app_memory,
             fault_policy,
             storage_policy,
@@ -728,11 +919,17 @@ impl<C: Chip, D: ProcessStandardDebug> SequentialProcessLoaderMachine<'_, C, D> 
                             policy.to_short_id(&process_binary)
                         });
 
+                        // TODO: get the shared libraries from somewhere
+                        // let dep_libs = process_binary.filter_shared_library_dependencies([]);
+                        let dep_libs: [Option<SharedLibrary>; NUM_SHLIB_DEPS] =
+                            [None; NUM_SHLIB_DEPS];
+
                         // Try to create a `Process` object.
                         let load_result = load_process(
                             self.kernel,
                             self.chip,
                             process_binary,
+                            dep_libs,
                             self.app_memory.take(),
                             short_app_id,
                             index,

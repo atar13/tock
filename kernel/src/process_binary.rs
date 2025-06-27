@@ -8,10 +8,12 @@
 //! it is loaded into a runnable `Process` object.
 
 use core::fmt;
+use tock_tbf::types::NUM_SHLIB_DEPS;
 
 use crate::config;
 use crate::debug;
 use crate::process_checker::AcceptedCredential;
+use crate::shared_library::SharedLibrary;
 use crate::utilities::cells::OptionalCell;
 
 /// Errors resulting from trying to load a process binary structure from flash.
@@ -52,6 +54,9 @@ pub enum ProcessBinaryError {
 
     /// This entry in flash is just padding.
     Padding,
+
+    /// This entry in flash is a shared library.
+    SharedLibrary,
 }
 
 impl From<tock_tbf::types::TbfParseError> for ProcessBinaryError {
@@ -108,6 +113,10 @@ impl fmt::Debug for ProcessBinaryError {
             ProcessBinaryError::Padding => {
                 write!(f, "Process item is just padding")
             }
+
+            ProcessBinaryError::SharedLibrary => {
+                write!(f, "Process item is a shared library")
+            }
         }
     }
 }
@@ -146,7 +155,12 @@ impl ProcessBinary {
 
         // Parse the full TBF header to see if this is a valid app. If the
         // header can't parse, we will error right here.
-        let tbf_header = tock_tbf::parse::parse_tbf_header(header_flash, tbf_version)?;
+        let res = tock_tbf::parse::parse_tbf_header(header_flash, tbf_version);
+
+        let tbf_header = match res {
+            Ok(x) => x,
+            Err(e) => panic!("{:?}", e),
+        };
 
         // If this isn't an app (i.e. it is padding) then we can skip it and do
         // not create a `ProcessBinary` object.
@@ -173,6 +187,18 @@ impl ProcessBinary {
                 );
             }
             return Err(ProcessBinaryError::NotEnabledProcess);
+        }
+
+        if tbf_header.is_shared_library().unwrap_or(false) {
+            if config::CONFIG.debug_load_processes {
+                debug!(
+                    "Shared Library in flash={:#010X}-{:#010X} process={:?}",
+                    app_flash.as_ptr() as usize,
+                    app_flash.as_ptr() as usize + app_flash.len() - 1,
+                    tbf_header.get_package_name().unwrap_or("(no name)")
+                );
+            }
+            return Err(ProcessBinaryError::SharedLibrary);
         }
 
         if let Some((major, minor)) = tbf_header.get_kernel_version() {
@@ -257,5 +283,29 @@ impl ProcessBinary {
         unsafe {
             core::slice::from_raw_parts(self.flash.as_ptr(), self.header.get_binary_end() as usize)
         }
+    }
+
+    pub fn filter_shared_library_dependencies<'a>(
+        &self,
+        all_libraries: &'a [Option<SharedLibrary>; NUM_SHLIB_DEPS],
+    ) -> [Option<SharedLibrary>; NUM_SHLIB_DEPS] {
+        let dep_names = self.header.get_shared_library_deps();
+
+        let mut filtered_deps = [const { None }; NUM_SHLIB_DEPS];
+        for lib in all_libraries {
+            if let Some(lib) = lib {
+                if let Some(name) = lib.get_name() {
+                    if dep_names.contains(&Some(name)) {
+                        // This library is a dependency of the process.
+                        let index = dep_names
+                            .iter()
+                            .position(|n| *n == Some(name))
+                            .expect("Library name should be in dependency list");
+                        filtered_deps[index] = Some((*lib).clone());
+                    }
+                }
+            }
+        }
+        return filtered_deps;
     }
 }
